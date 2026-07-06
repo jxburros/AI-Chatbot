@@ -46,6 +46,41 @@ runtime module graph in this test. Consuming apps on Turbopack (or asking
 "can I just vendor and go") should vendor `dist/` instead, or the nugget
 could document that caveat next to the two distribution paths.
 
+## Gap: no built-in way to "attach a model" — apps have to build the whole seam
+
+The first version of this app hardcoded provider/model/key via server env
+vars, with no way for the end user to pick a model. Adding that (server-side
+allowlist of `Connection`s in `lib/ai-config.ts`, a `GET /api/models` route
+that calls `handler.listModels()` per connection, a picker UI, and
+`connectionId`/`model` threaded through `/api/chat`) was straightforward with
+the primitives the nugget already exposes, but it's entirely app-built — the
+nugget has no opinion on it, which is consistent with it not being a router
+(see README "Non-goals"), but the *pattern* is general enough that every
+consuming app will probably reinvent it. Two things worth documenting in the
+nugget itself as a recommended pattern (raised back as a suggestion, not
+something we changed in AI-Nugget from this repo):
+
+1. **`provider`/`baseUrl` must come from a server-side allowlist, never
+   client input — but `model` is fine as free-form client input.** Letting a
+   client pick an arbitrary `provider`/`baseUrl` would let it point the
+   server's own `KeySource` resolution at an attacker-controlled endpoint
+   (SSRF, plus the server's real key gets sent to wherever `baseUrl` points).
+   `model` carries no such risk: a bad value just comes back as an ordinary
+   provider error. This asymmetry isn't obvious from the `Connection`/
+   `ChatRequest` type split alone (both `provider`/`baseUrl` on `Connection`
+   and `model` on `ChatRequest` are just strings) — worth a one-line callout
+   in the README's `KeySource`/`Connection` docs.
+2. **`listModels()` is optional per adapter, and two of the four engines
+   (`anthropic`, `google`) always return `[]`** (confirmed by grepping the
+   vendored adapters — no `listModels` method on either engine file). The
+   `ProviderCapabilities`/provider table documents `nativeTools`/`jsonMode`/
+   `local`/`embeddable` per provider, but not "supports model discovery" —
+   an app building a model picker on `listModels()` needs to know this
+   up front to design a fallback (here: a per-connection `defaultModel`),
+   not discover it by getting an empty dropdown for Claude/Gemini. Worth
+   adding a `modelDiscovery: boolean` (or similar) to the capabilities table,
+   or at minimum a callout next to `listModels()` in the README.
+
 ## What worked cleanly
 
 - `AIHandler.stream(connection, request)` mapped directly onto a Next.js
@@ -59,8 +94,12 @@ could document that caveat next to the two distribution paths.
   a local fake OpenAI-compatible SSE server (`openai-compat` profile) to
   confirm the full delta/done event stream works end-to-end.
 - Provider switching is a pure config change (`AI_PROVIDER`/`AI_MODEL`/
-  `AI_BASE_URL`/`AI_API_KEY_ENV`) with zero code changes, exactly as
-  advertised by the profile-table design.
+  `AI_BASE_URL`/`AI_API_KEY_ENV`, or `AI_CONNECTIONS` for several at once)
+  with zero code changes, exactly as advertised by the profile-table design.
+- `handler.listModels()` worked as the live model-discovery seam for the
+  engines that implement it — verified against a local fake OpenAI-compatible
+  server exposing `/v1/models`, and against one that 404s on it (simulating
+  `anthropic`/`google`) to confirm the empty-result + fallback path.
 
 ## Validation performed
 

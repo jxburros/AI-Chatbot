@@ -147,6 +147,46 @@ body {
   opacity: 0.85;
 }
 
+.model-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 0.85rem;
+}
+
+.model-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.7rem;
+  opacity: 0.9;
+}
+
+.model-field select {
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  background: rgba(255, 255, 255, 0.15);
+  color: white;
+  font-size: 0.8rem;
+  min-width: 9rem;
+}
+
+.model-field select:disabled {
+  opacity: 0.6;
+}
+
+.model-field select option {
+  color: var(--foreground);
+}
+
+.model-warning {
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: #ffe3e0;
+  opacity: 0.9;
+}
+
 .chat-scroll {
   flex: 1;
   overflow-y: auto;

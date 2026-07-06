@@ -7,6 +7,14 @@ interface Message {
   content: string;
 }
 
+interface ConnectionOption {
+  id: string;
+  label: string;
+  provider: string;
+  models: string[];
+  error?: string;
+}
+
 const GRASS_EMOJIS = ['🌷', '🌼', '🌻', '🌱', '🌿', '🌸'];
 const GRASS_ROW = Array.from({ length: 24 }, (_, i) => GRASS_EMOJIS[i % GRASS_EMOJIS.length]);
 
@@ -30,13 +38,51 @@ export default function ChatApp() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  const [connections, setConnections] = useState<ConnectionOption[]>([]);
+  const [connectionsError, setConnectionsError] = useState<string | null>(null);
+  const [connectionId, setConnectionId] = useState<string>('');
+  const [model, setModel] = useState<string>('');
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/models')
+      .then((res) => res.json())
+      .then((data: { connections: ConnectionOption[] }) => {
+        if (cancelled) return;
+        setConnections(data.connections);
+        const firstUsable = data.connections.find((c) => c.models.length > 0) ?? data.connections[0];
+        if (firstUsable) {
+          setConnectionId(firstUsable.id);
+          setModel(firstUsable.models[0] ?? '');
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setConnectionsError(err instanceof Error ? err.message : 'Could not load models');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
+  function handleConnectionChange(nextId: string) {
+    setConnectionId(nextId);
+    const next = connections.find((c) => c.id === nextId);
+    setModel(next?.models[0] ?? '');
+  }
+
+  const selectedConnection = connections.find((c) => c.id === connectionId);
+
   async function sendMessage(text: string) {
     const trimmed = text.trim();
     if (!trimmed || isStreaming) return;
+    if (!connectionId || !model) {
+      setError('Pick a garden bed (provider) and a model before planting a message.');
+      return;
+    }
 
     setError(null);
     const nextMessages: Message[] = [...messages, { role: 'user', content: trimmed }];
@@ -51,7 +97,7 @@ export default function ChatApp() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: nextMessages }),
+        body: JSON.stringify({ messages: nextMessages, connectionId, model }),
         signal: controller.signal,
       });
 
@@ -132,6 +178,42 @@ export default function ChatApp() {
               <p>a small, sunny AI assistant</p>
             </div>
           </div>
+
+          <div className="model-row">
+            <label className="model-field">
+              <span>🪴 Garden bed</span>
+              <select
+                value={connectionId}
+                onChange={(e) => handleConnectionChange(e.target.value)}
+                disabled={isStreaming || connections.length === 0}
+              >
+                {connections.length === 0 && <option value="">Loading…</option>}
+                {connections.map((c) => (
+                  <option key={c.id} value={c.id} disabled={c.models.length === 0}>
+                    {c.label}
+                    {c.models.length === 0 ? ' (unavailable)' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="model-field">
+              <span>🌼 Model</span>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                disabled={isStreaming || !selectedConnection || selectedConnection.models.length === 0}
+              >
+                {(selectedConnection?.models ?? []).map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {selectedConnection?.error && <p className="model-warning">🥀 {selectedConnection.error}</p>}
+          {connectionsError && <p className="model-warning">🥀 {connectionsError}</p>}
         </header>
 
         <div className="chat-scroll" ref={scrollRef}>
