@@ -7,14 +7,15 @@ retries, and streaming for OpenAI, Anthropic, Google, Ollama, and
 OpenAI-compatible endpoints.
 
 This app exists to test how effectively the AI Nugget can be used as the
-provider layer for a real app. The nugget's `nugget/` build (source form,
-since it can't take a package dependency without a registry token here) is
-vendored at `vendor/ai-handler/`.
+provider layer for a real app. Since it can't take a package dependency
+without a registry token here, the library's compiled `dist/` output is
+vendored at `vendor/ai-handler/` (see `NUGGET_TEST_NOTES.md` for why `dist/`
+rather than the `nugget/` source build).
 
 ## How it's wired
 
-- `vendor/ai-handler/` — the vendored AI Nugget source (`src/` from the
-  library's `nugget/` build output).
+- `vendor/ai-handler/` — the vendored AI Nugget, compiled JS + `.d.ts`
+  (copied from the library's own `dist/`).
 - `lib/ai-config.ts` — maps env vars to a `Connection` + `KeyRef` for the
   nugget's `AIHandler`. This mapping is app-owned by design: the nugget
   intentionally ships no default provider policy.
@@ -30,7 +31,9 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+Open [http://localhost:3000](http://localhost:3000) — `npm run dev` picks the
+next free port automatically (3001, 3002, ...) if 3000 is already in use, and
+prints which one it landed on.
 
 ### Configuring a provider
 
@@ -58,7 +61,7 @@ AI_MODEL=llama3.2
 ## Commands
 
 ```bash
-npm run dev      # start the dev server
+npm run dev      # start the dev server (auto-picks a free port)
 npm run build    # production build (also the typecheck, via next build)
 npm run lint     # eslint
 ```
