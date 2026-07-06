@@ -1,0 +1,160 @@
+import { AIError } from '../../errors.js';
+import { estimatedUsage } from '../../tokens.js';
+import { fetchJson, ndjsonLines, postResponse } from '../../transport.js';
+import { asNumber, asRecord, asString, textFromMessages } from '../../util.js';
+import { DEFAULT_TIMEOUT_MS, streamError, streamTimeout } from './base.js';
+export class OllamaAdapter {
+    provider;
+    constructor(provider) {
+        this.provider = provider;
+    }
+    async chat(conn, req) {
+        let result;
+        for await (const event of this.stream(conn, req)) {
+            if (event.type === 'done')
+                result = event.result;
+            if (event.type === 'error')
+                throw event.error;
+        }
+        if (!result)
+            throw new AIError('Ollama stream ended without a result', { kind: 'invalid_response', provider: conn.provider });
+        return result;
+    }
+    async *stream(conn, req) {
+        const started = Date.now();
+        let firstTokenMs = null;
+        let text = '';
+        let inputTokens;
+        let outputTokens;
+        let doneReason;
+        const toolCalls = [];
+        const timeout = streamTimeout(conn, req.signal);
+        yield { type: 'start', callId: '', provider: conn.provider, model: req.model };
+        try {
+            const res = await postResponse(`${conn.baseUrl}/api/chat`, body(req), conn.headers, timeout.signal, conn.provider);
+            for await (const value of ndjsonLines(res)) {
+                const record = asRecord(value);
+                const message = asRecord(record?.message);
+                const piece = asString(message?.content);
+                if (piece) {
+                    if (firstTokenMs === null)
+                        firstTokenMs = Date.now() - started;
+                    text += piece;
+                    yield { type: 'delta', text: piece };
+                }
+                inputTokens = asNumber(record?.prompt_eval_count) ?? inputTokens;
+                outputTokens = asNumber(record?.eval_count) ?? outputTokens;
+                doneReason = asString(record?.done_reason) ?? doneReason;
+                const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+                for (const callValue of calls) {
+                    const fn = asRecord(asRecord(callValue)?.function);
+                    const args = fn?.arguments ?? {};
+                    const toolCall = {
+                        id: randomId(),
+                        name: asString(fn?.name) ?? 'unknown',
+                        arguments: args,
+                        raw: typeof args === 'string' ? args : JSON.stringify(args),
+                    };
+                    toolCalls.push(toolCall);
+                    yield { type: 'tool_call', call: toolCall };
+                }
+            }
+            const hasTools = toolCalls.length > 0;
+            yield { type: 'done', result: {
+                    text,
+                    toolCalls: hasTools ? toolCalls : undefined,
+                    finishReason: hasTools ? 'tool' : doneReason === 'length' ? 'length' : 'stop',
+                    usage: inputTokens !== undefined || outputTokens !== undefined ? { inputTokens, outputTokens, estimated: false } : estimatedUsage(textFromMessages(req.messages), text),
+                    timing: { firstTokenMs, totalMs: Date.now() - started },
+                    model: req.model,
+                    source: { provider: conn.provider, connectionId: conn.id, baseUrl: conn.baseUrl },
+                } };
+        }
+        catch (error) {
+            throw streamError(error, timeout, conn.provider);
+        }
+        finally {
+            timeout.done();
+        }
+    }
+    async listModels(conn) {
+        const { data } = await fetchJson(`${conn.baseUrl}/api/tags`, {
+            method: 'GET',
+            headers: conn.headers,
+            timeoutMs: conn.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            provider: conn.provider,
+        });
+        const models = Array.isArray(asRecord(data)?.models) ? asRecord(data).models : [];
+        const ids = models.map((model) => asString(asRecord(model)?.name) ?? asString(asRecord(model)?.model) ?? '').filter(Boolean);
+        // Probe /api/show per model for context window + capabilities (best effort, sequential
+        // to avoid overwhelming a local Ollama instance).
+        const results = [];
+        for (const id of ids) {
+            const info = { id, source: { provider: conn.provider, connectionId: conn.id, baseUrl: conn.baseUrl } };
+            const probed = await this.showModel(conn, id).catch(() => undefined);
+            if (probed?.contextWindow !== undefined)
+                info.contextWindow = probed.contextWindow;
+            if (probed?.capabilities)
+                info.capabilities = probed.capabilities;
+            results.push(info);
+        }
+        return results;
+    }
+    async showModel(conn, model) {
+        const { data } = await fetchJson(`${conn.baseUrl}/api/show`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...conn.headers },
+            body: JSON.stringify({ model }),
+            timeoutMs: Math.min(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, 15_000),
+            provider: conn.provider,
+        });
+        const record = asRecord(data);
+        const modelInfo = asRecord(record?.model_info);
+        let contextWindow;
+        if (modelInfo) {
+            for (const [key, value] of Object.entries(modelInfo)) {
+                if (key.endsWith('.context_length') && typeof value === 'number') {
+                    contextWindow = value;
+                    break;
+                }
+            }
+        }
+        const caps = record?.capabilities;
+        const capabilities = Array.isArray(caps) && caps.every((c) => typeof c === 'string') ? caps : undefined;
+        const result = {};
+        if (contextWindow !== undefined)
+            result.contextWindow = contextWindow;
+        if (capabilities)
+            result.capabilities = capabilities;
+        return result;
+    }
+}
+function body(req) {
+    return {
+        model: req.model,
+        messages: req.messages.map(toOllamaMessage),
+        stream: true,
+        options: { temperature: req.temperature, num_predict: req.maxTokens, top_p: req.topP, stop: req.stopSequences },
+        format: req.responseFormat?.type === 'json' ? (req.responseFormat.schema ?? 'json') : undefined,
+        tools: req.tools?.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })),
+    };
+}
+function toOllamaMessage(m) {
+    const images = typeof m.content === 'string' ? undefined : m.content.filter((part) => part.type === 'image').map((part) => part.imageBase64).filter(Boolean);
+    const message = {
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : m.content.filter((part) => part.type === 'text').map((part) => part.text ?? '').join('\n'),
+    };
+    if (images && images.length)
+        message.images = images;
+    if (m.role === 'tool' && m.name)
+        message.tool_name = m.name;
+    if (m.role === 'assistant' && m.toolCalls?.length) {
+        message.tool_calls = m.toolCalls.map((call) => ({ function: { name: call.name, arguments: call.arguments ?? {} } }));
+    }
+    return message;
+}
+function randomId() {
+    return globalThis.crypto?.randomUUID?.() ?? `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+//# sourceMappingURL=ollama.js.map
