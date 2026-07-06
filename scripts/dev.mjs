@@ -1,16 +1,32 @@
 import { createServer } from 'node:net';
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const START_PORT = Number(process.env.PORT) || 3000;
 const MAX_ATTEMPTS = 20;
+// Next binds both the IPv4 and IPv6 wildcard addresses, so a port only
+// counts as free if it's open on both.
+const HOSTS_TO_CHECK = ['0.0.0.0', '::'];
 
-function isPortFree(port) {
+function isHostPortFree(port, host) {
   return new Promise((resolve) => {
     const tester = createServer();
-    tester.once('error', () => resolve(false));
+    // Only EADDRINUSE means the port is actually taken. Any other error
+    // (e.g. EAFNOSUPPORT on hosts without IPv6) just means this address
+    // family isn't usable here, not that the port is busy.
+    tester.once('error', (error) => resolve(error.code !== 'EADDRINUSE'));
     tester.once('listening', () => tester.close(() => resolve(true)));
-    tester.listen(port, '0.0.0.0');
+    tester.listen(port, host);
   });
+}
+
+async function isPortFree(port) {
+  for (const host of HOSTS_TO_CHECK) {
+    if (!(await isHostPortFree(port, host))) return false;
+  }
+  return true;
 }
 
 async function findFreePort(startPort) {
@@ -25,9 +41,9 @@ if (port !== START_PORT) {
   console.log(`Port ${START_PORT} is in use, starting on ${port} instead.`);
 }
 
-const child = spawn('npx', ['next', 'dev', '-p', String(port)], {
+const nextBin = require.resolve('next/dist/bin/next');
+const child = spawn(process.execPath, [nextBin, 'dev', '-p', String(port)], {
   stdio: 'inherit',
-  shell: process.platform === 'win32',
 });
 
 child.on('exit', (code) => process.exit(code ?? 0));
