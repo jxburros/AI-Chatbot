@@ -1,6 +1,6 @@
 import { AIHandler, envKeySource } from '@jxburros/ai-handler';
 import type { ChatMessage } from '@jxburros/ai-handler';
-import { loadAiConfig } from '@/lib/ai-config';
+import { findConnection, loadConnections } from '@/lib/ai-config';
 
 export const runtime = 'nodejs';
 
@@ -13,6 +13,8 @@ Keep responses concise unless the user asks for depth.`;
 
 interface ChatRequestBody {
   messages: { role: 'user' | 'assistant'; content: string }[];
+  connectionId: string;
+  model: string;
 }
 
 export async function POST(request: Request) {
@@ -26,8 +28,22 @@ export async function POST(request: Request) {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return Response.json({ error: 'messages array is required' }, { status: 400 });
   }
+  if (typeof body.model !== 'string' || !body.model) {
+    return Response.json({ error: 'model is required' }, { status: 400 });
+  }
 
-  const config = loadAiConfig();
+  // connectionId is resolved against the server's own allowlist
+  // (loadConnections()) — the client never gets to hand us an arbitrary
+  // provider/baseUrl to call out to, only a choice among what the server
+  // already trusts. `model` is fine to take as free-form client input: a
+  // bad value just comes back as an ordinary provider error, not a
+  // security issue.
+  const connections = loadConnections();
+  const connection = findConnection(connections, body.connectionId);
+  if (!connection) {
+    return Response.json({ error: `Unknown connection: ${body.connectionId}` }, { status: 400 });
+  }
+
   const handler = new AIHandler({ keySource: envKeySource() });
 
   const messages: ChatMessage[] = [
@@ -47,13 +63,13 @@ export async function POST(request: Request) {
       try {
         for await (const event of handler.stream(
           {
-            id: 'main',
-            provider: config.provider,
-            baseUrl: config.baseUrl,
-            keyRef: config.keyRef,
+            id: connection.id,
+            provider: connection.provider,
+            baseUrl: connection.baseUrl,
+            keyRef: connection.keyRef,
           },
           {
-            model: config.model,
+            model: body.model,
             messages,
             signal: abortController.signal,
           },

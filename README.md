@@ -20,9 +20,17 @@ rather than the `nugget/` source build).
   nugget's `AIHandler`. This mapping is app-owned by design: the nugget
   intentionally ships no default provider policy.
 - `app/api/chat/route.ts` — a Route Handler that calls `handler.stream(...)`
-  and re-emits `delta`/`done`/`error` events as Server-Sent Events.
+  and re-emits `delta`/`done`/`error` events as Server-Sent Events. The client
+  picks a `connectionId` + `model`; the route resolves `connectionId` against
+  `loadConnections()`'s server-side allowlist rather than trusting a
+  client-supplied provider/baseUrl.
+- `app/api/models/route.ts` — calls `handler.listModels()` per configured
+  connection so the UI can offer a live model list, falling back to each
+  connection's `defaultModel` when the provider's adapter doesn't implement
+  discovery (see "Attaching/selecting a model" below).
 - `components/ChatApp.tsx` — the chat UI (client component) that reads the
-  SSE stream and renders it with a garden/spring theme.
+  SSE stream, renders it with a garden/spring theme, and offers a provider +
+  model picker in the header.
 
 ## Getting started
 
@@ -57,6 +65,28 @@ For a local model with no key, e.g. Ollama:
 AI_PROVIDER=ollama
 AI_MODEL=llama3.2
 ```
+
+### Attaching/selecting a model
+
+The chat header has a "🪴 Garden bed" (connection) and "🌼 Model" picker. By
+default there's one connection (from `AI_PROVIDER` above). To offer several,
+set `AI_CONNECTIONS` instead — a JSON array, each entry needing at least a
+`provider`:
+
+```bash
+AI_CONNECTIONS=[{"id":"openai","label":"OpenAI","provider":"openai","defaultModel":"gpt-4o-mini"},{"id":"anthropic","label":"Anthropic","provider":"anthropic","defaultModel":"claude-sonnet-5"},{"id":"ollama","label":"Local Ollama","provider":"ollama","baseUrl":"http://localhost:11434"}]
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+`GET /api/models` calls the nugget's `handler.listModels()` for each
+connection to populate the model dropdown live. Two of the four adapter
+engines (`anthropic`, `google`) don't implement model discovery and always
+return `[]` — for those, set `defaultModel` on the connection so it still has
+something selectable; the UI surfaces the underlying error (e.g. a 404 or
+missing key) next to the picker rather than hiding it. `connectionId` is
+always resolved against this server-side list — the client can only choose
+among what's configured here, never supply an arbitrary provider/baseUrl.
 
 ## Commands
 
