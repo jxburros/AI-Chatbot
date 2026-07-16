@@ -100,3 +100,5 @@ npm run lint     # eslint
 
 See `NUGGET_TEST_NOTES.md` for issues encountered while integrating the AI
 Nugget into a real app, and how they were worked around.
+
+<!-- GitHub Pages deployment is configured in .github/workflows/pages.yml. -->
