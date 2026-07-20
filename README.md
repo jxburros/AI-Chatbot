@@ -52,11 +52,11 @@ to change providers:
 # .env.local
 AI_PROVIDER=openai        # openai | anthropic | google | ollama | groq | ...
 AI_MODEL=gpt-4o-mini
-OPENAI_API_KEY=sk-...      # key env var name depends on AI_PROVIDER, see lib/ai-config.ts
+# Set OPENAI_API_KEY in the environment; do not commit its value.
 
 # Optional overrides
-AI_BASE_URL=               # for local runtimes (ollama/lmstudio/llamacpp/vllm) or self-hosted proxies
-AI_API_KEY_ENV=             # override which env var holds the key
+AI_BASE_URL=               # local runtime or self-hosted proxy URL
+AI_API_KEY_ENV=            # override which env var holds the key
 ```
 
 For a local model with no key, e.g. Ollama:
@@ -73,18 +73,34 @@ default there's one connection (from `AI_PROVIDER` above). To offer several,
 set `AI_CONNECTIONS` instead — a JSON array, each entry needing at least a
 `provider`:
 
-```bash
-AI_CONNECTIONS=[{"id":"openai","label":"OpenAI","provider":"openai","defaultModel":"gpt-4o-mini"},{"id":"anthropic","label":"Anthropic","provider":"anthropic","defaultModel":"claude-sonnet-5"},{"id":"ollama","label":"Local Ollama","provider":"ollama","baseUrl":"http://localhost:11434"}]
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
+```json
+[
+  {
+    "id": "primary",
+    "label": "Primary",
+    "provider": "openai",
+    "defaultModel": "your-model"
+  },
+  {
+    "id": "local",
+    "label": "Local",
+    "provider": "ollama",
+    "baseUrl": "http://localhost:11434"
+  }
+]
 ```
+
+Serialize that array as the `AI_CONNECTIONS` environment variable. Supported
+fields are `id`, `label`, `provider`, `baseUrl`, `keyEnv`, and `defaultModel`.
+Keep provider keys in the environment variables named by `keyEnv`; never put
+key values inside `AI_CONNECTIONS`.
 
 `GET /api/models` calls the nugget's `handler.listModels()` for each
 connection to populate the model dropdown live. Two of the four adapter
 engines (`anthropic`, `google`) don't implement model discovery and always
 return `[]` — for those, set `defaultModel` on the connection so it still has
-something selectable; the UI surfaces the underlying error (e.g. a 404 or
-missing key) next to the picker rather than hiding it. `connectionId` is
+something selectable. The API labels that value as a configured fallback, and
+the UI shows a generic discovery warning. `connectionId` is
 always resolved against this server-side list — the client can only choose
 among what's configured here, never supply an arbitrary provider/baseUrl.
 

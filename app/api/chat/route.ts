@@ -1,6 +1,8 @@
 import { AIHandler, envKeySource } from '@jxburros/ai-handler';
 import type { ChatMessage } from '@jxburros/ai-handler';
 import { findConnection, loadConnections } from '@/lib/ai-config';
+import { validateChatRequest } from '@/lib/chat-request';
+import { resolveConnectionModels } from '@/lib/models';
 
 export const runtime = 'nodejs';
 
@@ -11,33 +13,30 @@ ideas, planting thoughts, sunny outlooks) and an emoji here and there (🌱 🌸
 but never let the whimsy get in the way of a clear, useful, accurate answer.
 Keep responses concise unless the user asks for depth.`;
 
-interface ChatRequestBody {
-  messages: { role: 'user' | 'assistant'; content: string }[];
-  connectionId: string;
-  model: string;
-}
+const MAX_REQUEST_CHARS = 64_000;
 
 export async function POST(request: Request) {
-  let body: ChatRequestBody;
+  let parsed: unknown;
   try {
-    body = await request.json();
+    const raw = await request.text();
+    if (raw.length > MAX_REQUEST_CHARS) {
+      return Response.json({ error: 'Request body is too large' }, { status: 413 });
+    }
+    parsed = JSON.parse(raw);
   } catch {
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    return Response.json({ error: 'messages array is required' }, { status: 400 });
+  const validation = validateChatRequest(parsed);
+  if (!validation.ok) {
+    return Response.json({ error: validation.error }, { status: 400 });
   }
-  if (typeof body.model !== 'string' || !body.model) {
-    return Response.json({ error: 'model is required' }, { status: 400 });
-  }
+  const body = validation.value;
 
   // connectionId is resolved against the server's own allowlist
   // (loadConnections()) — the client never gets to hand us an arbitrary
   // provider/baseUrl to call out to, only a choice among what the server
-  // already trusts. `model` is fine to take as free-form client input: a
-  // bad value just comes back as an ordinary provider error, not a
-  // security issue.
+  // already trusts.
   const connections = loadConnections();
   const connection = findConnection(connections, body.connectionId);
   if (!connection) {
@@ -45,6 +44,10 @@ export async function POST(request: Request) {
   }
 
   const handler = new AIHandler({ keySource: envKeySource() });
+  const modelResolution = await resolveConnectionModels(handler, connection);
+  if (!modelResolution.models.includes(body.model)) {
+    return Response.json({ error: 'Model is not allowed for this connection' }, { status: 400 });
+  }
 
   const messages: ChatMessage[] = [
     { role: 'system', content: SYSTEM_PROMPT },
