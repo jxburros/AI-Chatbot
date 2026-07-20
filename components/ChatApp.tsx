@@ -12,6 +12,8 @@ interface ConnectionOption {
   label: string;
   provider: string;
   models: string[];
+  modelSource: 'discovered' | 'fallback' | 'unavailable';
+  warning?: string;
   error?: string;
 }
 
@@ -37,6 +39,7 @@ export default function ChatApp() {
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const streamingRef = useRef(false);
 
   const [connections, setConnections] = useState<ConnectionOption[]>([]);
   const [connectionsError, setConnectionsError] = useState<string | null>(null);
@@ -50,10 +53,14 @@ export default function ChatApp() {
       .then((data: { connections: ConnectionOption[] }) => {
         if (cancelled) return;
         setConnections(data.connections);
-        const firstUsable = data.connections.find((c) => c.models.length > 0) ?? data.connections[0];
+        const firstUsable = data.connections.find((c) => c.models.length > 0);
         if (firstUsable) {
           setConnectionId(firstUsable.id);
-          setModel(firstUsable.models[0] ?? '');
+          setModel(firstUsable.models[0]);
+        } else {
+          setConnectionId('');
+          setModel('');
+          setConnectionsError('No configured connection currently has a usable model.');
         }
       })
       .catch((err) => {
@@ -78,7 +85,7 @@ export default function ChatApp() {
 
   async function sendMessage(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || isStreaming) return;
+    if (!trimmed || streamingRef.current) return;
     if (!connectionId || !model) {
       setError('Pick a garden bed (provider) and a model before planting a message.');
       return;
@@ -88,6 +95,7 @@ export default function ChatApp() {
     const nextMessages: Message[] = [...messages, { role: 'user', content: trimmed }];
     setMessages([...nextMessages, { role: 'assistant', content: '' }]);
     setInput('');
+    streamingRef.current = true;
     setIsStreaming(true);
 
     const controller = new AbortController();
@@ -151,6 +159,7 @@ export default function ChatApp() {
       });
     } finally {
       setIsStreaming(false);
+      streamingRef.current = false;
       abortRef.current = null;
     }
   }
@@ -212,7 +221,7 @@ export default function ChatApp() {
               </select>
             </label>
           </div>
-          {selectedConnection?.error && <p className="model-warning">🥀 {selectedConnection.error}</p>}
+          {(selectedConnection?.warning || selectedConnection?.error) && <p className="model-warning">🥀 {selectedConnection.warning ?? selectedConnection.error}</p>}
           {connectionsError && <p className="model-warning">🥀 {connectionsError}</p>}
         </header>
 
