@@ -118,3 +118,9 @@ See `NUGGET_TEST_NOTES.md` for issues encountered while integrating the AI
 Nugget into a real app, and how they were worked around.
 
 <!-- GitHub Pages deployment is configured in .github/workflows/pages.yml. -->
+
+---
+
+## Project Stewardship
+
+This project is developed by **Jeffrey** through **JX Holdings, LLC**. GitHub: [`jxburros`](https://github.com/jxburros).
