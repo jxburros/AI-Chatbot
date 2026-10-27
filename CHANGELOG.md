@@ -3,7 +3,7 @@
 ## 2026-10-27 — Codex
 
 ### Changed
-- Adopt AI-Nugget 0.7.5 from source commit `b4d72370596633d78cccfd10301543f62b80fdf7` for the provider/cloud expansion; preserve application-owned policy and model selection.
+- Adopt AI-Nugget 0.7.5 from source commit `f8e563fd6c23957b0885e131c5aac4e9a7851693` for the provider/cloud expansion; preserve application-owned policy and model selection.
 
 ### Not completed
 - Live provider calls were not exercised (no configured provider test credentials).

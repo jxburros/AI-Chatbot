@@ -127,4 +127,4 @@ This project is developed by **Jeffrey** through **JX Holdings, LLC**. GitHub: [
 
 ### AI Nugget adoption
 
-This branch adopts AI Nugget 0.7.5 from source commit [`b4d723705966`](https://github.com/jxburros/AI-Nugget/commit/b4d72370596633d78cccfd10301543f62b80fdf7) while [the upstream change](https://github.com/jxburros/AI-Nugget/pull/98) is under review. Package consumers use an immutable Git pin; vendored and CDN consumers retain the same source provenance. After the upstream release is published, package consumers can move to the corresponding registry version. App-specific model selection and provider configuration still apply.
+This branch adopts AI Nugget 0.7.5 from source commit [`f8e563fd6c23`](https://github.com/jxburros/AI-Nugget/commit/f8e563fd6c23957b0885e131c5aac4e9a7851693) while [the upstream change](https://github.com/jxburros/AI-Nugget/pull/98) is under review. The compiled vendor copy records provenance in `vendor/ai-handler/SOURCE.txt`. App-specific model selection and provider configuration still apply.
