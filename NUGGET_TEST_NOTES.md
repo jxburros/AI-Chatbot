@@ -1,5 +1,10 @@
 # AI Nugget integration test notes
 
+## Current adoption (2026-10-27)
+
+The compiled vendor now contains AI Nugget 0.7.5, with the immutable upstream commit recorded in `vendor/ai-handler/SOURCE.txt`. The npm package is named `@jxburros/ai-nugget` and is publicly installable without a registry token. This app keeps its existing `@jxburros/ai-handler` alias to the compiled JavaScript. The Next.js production build passes with that integration. The observations below are historical, including the old package name and registry-token restriction.
+
+
 This app was built specifically to test whether `@jxburros/ai-handler` ("the
 AI Nugget") can be dropped into a real app and used effectively. Overall: yes
 — once past one packaging/bundler wrinkle below, `AIHandler.stream()` +

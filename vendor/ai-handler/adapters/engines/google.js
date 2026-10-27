@@ -1,8 +1,8 @@
 import { AIError } from '../../errors.js';
 import { estimatedUsage } from '../../tokens.js';
-import { postResponse, sseLines } from '../../transport.js';
-import { asNumber, asRecord, asString, textFromMessages } from '../../util.js';
-import { streamError, streamTimeout } from './base.js';
+import { fetchJson, postResponse, sseLines } from '../../transport.js';
+import { applyProviderOptions, REASONING_BUDGET_TOKENS, asNumber, asRecord, asString, joinUrl, textFromMessages } from '../../util.js';
+import { DEFAULT_TIMEOUT_MS, randomId, safeParse, streamAnomaly, streamError, streamTimeout } from './base.js';
 export class GoogleAdapter {
     provider;
     constructor(provider) {
@@ -30,12 +30,23 @@ export class GoogleAdapter {
         const toolCalls = [];
         const timeout = streamTimeout(conn, req.signal);
         yield { type: 'start', callId: '', provider: conn.provider, model: req.model };
+        // Gemini rejects `responseMimeType: application/json` combined with function
+        // declarations, so `body()` drops JSON mode when tools are present. Surface
+        // that downgrade instead of silently returning unstructured text.
+        if (jsonModeDowngraded(req)) {
+            yield {
+                type: 'context',
+                kind: 'json_mode_downgraded',
+                data: { reason: 'Gemini does not accept JSON response mode together with tools; the request was sent without JSON mode', provider: conn.provider },
+            };
+        }
         try {
             const streamUrl = `${conn.baseUrl}/v1beta/models/${encodeURIComponent(req.model)}:streamGenerateContent?alt=sse`;
-            const res = await postResponse(streamUrl, body(req), conn.headers, timeout.signal, conn.provider);
+            const res = await postResponse(streamUrl, body(req), conn.headers, timeout.signal, conn.provider, conn.fetch);
             const contentType = res.headers.get('content-type') ?? '';
             const chunks = contentType.includes('text/event-stream') ? sseLines(res) : singleJsonLine(res);
             for await (const line of chunks) {
+                timeout.bump();
                 const parsed = safeParse(line);
                 const record = asRecord(parsed);
                 const promptFeedback = asRecord(record?.promptFeedback);
@@ -44,6 +55,12 @@ export class GoogleAdapter {
                 for (const part of candidateParts(record)) {
                     const partText = asString(asRecord(part)?.text);
                     if (partText) {
+                        // Gemini marks reasoning parts with `thought: true`; route those to
+                        // the reasoning channel so they don't blend into the answer text.
+                        if (asRecord(part)?.thought === true) {
+                            yield { type: 'reasoning', text: partText };
+                            continue;
+                        }
                         if (firstTokenMs === null)
                             firstTokenMs = Date.now() - started;
                         text += partText;
@@ -66,6 +83,8 @@ export class GoogleAdapter {
                 inputTokens = asNumber(usage?.promptTokenCount) ?? inputTokens;
                 outputTokens = asNumber(usage?.candidatesTokenCount) ?? outputTokens;
             }
+            if (!finish)
+                yield streamAnomaly('stream ended without a finishReason');
             const hasTools = toolCalls.length > 0;
             yield { type: 'done', result: {
                     text,
@@ -84,6 +103,63 @@ export class GoogleAdapter {
             timeout.done();
         }
     }
+    /**
+     * `GoogleAdapter` has no `listModels`, so without a `health` probe
+     * `AIHandler.testConnection` would report `ok: true` without ever making a
+     * network call. `/v1beta/models` is a lightweight, key-authenticated GET
+     * that gives an honest connectivity/auth check.
+     */
+    async health(conn) {
+        try {
+            await fetchJson(joinUrl(conn.baseUrl, '/v1beta/models'), {
+                method: 'GET',
+                headers: conn.headers,
+                timeoutMs: Math.min(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000),
+                provider: conn.provider,
+                fetch: conn.fetch,
+            });
+            return { ok: true };
+        }
+        catch (error) {
+            return { ok: false, detail: error instanceof Error ? error.message : 'Health check failed' };
+        }
+    }
+    /**
+     * Lists models from Google's `/v1beta/models`. Strips the `models/` name
+     * prefix, and maps `inputTokenLimit` → `contextWindow` and
+     * `supportedGenerationMethods` → `capabilities`.
+     */
+    async listModels(conn) {
+        const { data } = await fetchJson(joinUrl(conn.baseUrl, '/v1beta/models'), {
+            method: 'GET',
+            headers: conn.headers,
+            timeoutMs: Math.min(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, 15_000),
+            provider: conn.provider,
+            fetch: conn.fetch,
+        });
+        const rows = Array.isArray(asRecord(data)?.models) ? asRecord(data).models : [];
+        const models = [];
+        for (const value of rows) {
+            const row = asRecord(value);
+            const name = asString(row?.name);
+            if (!name)
+                continue;
+            const id = name.startsWith('models/') ? name.slice('models/'.length) : name;
+            const model = { id, source: { provider: conn.provider, connectionId: conn.id, baseUrl: conn.baseUrl } };
+            const contextWindow = asNumber(row?.inputTokenLimit);
+            if (contextWindow !== undefined)
+                model.contextWindow = contextWindow;
+            const methods = row?.supportedGenerationMethods;
+            if (Array.isArray(methods) && methods.every((m) => typeof m === 'string'))
+                model.capabilities = methods;
+            models.push(model);
+        }
+        return models;
+    }
+}
+/** True when the caller asked for JSON mode but tools force it off. */
+function jsonModeDowngraded(req) {
+    return req.responseFormat?.type === 'json' && !!req.tools?.length;
 }
 function body(req) {
     const systemText = req.messages.filter((m) => m.role === 'system').map((m) => textContent(m.content)).join('\n\n');
@@ -110,7 +186,17 @@ function body(req) {
             config.allowedFunctionNames = [req.toolChoice.name];
         payload.toolConfig = { functionCallingConfig: config };
     }
-    return payload;
+    if (req.reasoningEffort !== undefined) {
+        // First-class reasoning effort → Gemini's thinking budget. 0 disables
+        // thinking on models that allow it; others treat it as a minimum.
+        payload.generationConfig.thinkingConfig = {
+            thinkingBudget: REASONING_BUDGET_TOKENS[req.reasoningEffort],
+        };
+    }
+    // providerOptions reaches Google-native fields: top-level `safetySettings`,
+    // `cachedContent`, and `generationConfig` extras (`thinkingConfig`,
+    // `responseModalities`, …) merged one level deep into generationConfig.
+    return applyProviderOptions(payload, req.providerOptions, ['generationConfig']);
 }
 function toGoogleContents(messages) {
     const contents = [];
@@ -132,28 +218,26 @@ function toGoogleContents(messages) {
     return contents;
 }
 function toGoogleContent(m) {
-    if (m.role === 'tool') {
-        return {
-            role: 'user',
-            parts: [{ functionResponse: { name: m.name ?? 'unknown', response: toolResponseObject(m) } }],
-        };
-    }
+    // Tool-role messages are handled by toGoogleContents' batching loop and never
+    // reach here, so no tool branch is needed.
     if (m.role === 'assistant' && m.toolCalls?.length) {
-        const parts = [];
-        if (typeof m.content === 'string' && m.content)
-            parts.push({ text: m.content });
+        const parts = [...googleParts(m.content)];
         for (const call of m.toolCalls)
             parts.push({ functionCall: { name: call.name, args: call.arguments ?? {} } });
         return { role: 'model', parts };
     }
     return {
         role: m.role === 'assistant' ? 'model' : 'user',
-        parts: typeof m.content === 'string'
-            ? [{ text: m.content }]
-            : m.content.map((part) => part.type === 'image'
-                ? { inlineData: { mimeType: part.mimeType ?? 'image/png', data: part.imageBase64 ?? '' } }
-                : { text: part.text ?? '' }),
+        parts: googleParts(m.content),
     };
+}
+/** Maps text/image content — a string or a ContentPart[] — onto Google parts. */
+function googleParts(content) {
+    if (typeof content === 'string')
+        return content ? [{ text: content }] : [];
+    return content.map((part) => part.type === 'image'
+        ? { inlineData: { mimeType: part.mimeType ?? 'image/png', data: part.imageBase64 ?? '' } }
+        : { text: part.text ?? '' });
 }
 function textContent(content) {
     if (typeof content === 'string')
@@ -202,16 +286,5 @@ function mapFinish(finish, hasTools) {
     if (finish === 'SAFETY' || finish === 'RECITATION' || finish === 'BLOCKLIST' || finish === 'PROHIBITED_CONTENT')
         return 'content_filter';
     return 'stop';
-}
-function safeParse(line) {
-    try {
-        return JSON.parse(line);
-    }
-    catch {
-        return undefined;
-    }
-}
-function randomId() {
-    return globalThis.crypto?.randomUUID?.() ?? `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 }
 //# sourceMappingURL=google.js.map

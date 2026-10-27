@@ -1,3 +1,5 @@
+import type { KnownProvider } from './adapters/profiles.js';
+export type { KnownProvider };
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 export interface ContentPart {
     type: 'text' | 'image';
@@ -5,9 +7,18 @@ export interface ContentPart {
     imageBase64?: string;
     mimeType?: string;
 }
+/** Opaque provider response content, for replay within the same model/tool workflow.
+ * Keep it unmodified; never include it in telemetry or display it as answer text. */
+export interface ProviderState {
+    provider: string;
+    model: string;
+    protocol?: Connection['protocol'];
+    content: Record<string, unknown>[];
+}
 export interface ChatMessage {
     role: Role;
     content: string | ContentPart[];
+    providerState?: ProviderState;
     toolCalls?: ToolCall[];
     toolCallId?: string;
     name?: string;
@@ -23,12 +34,28 @@ export interface ToolSchema {
     description: string;
     parameters: object;
 }
+/**
+ * How hard a reasoning-capable model should think before answering. The nugget
+ * maps one vocabulary onto each provider's own knob (see `docs/providers.md`,
+ * "Reasoning effort"): OpenAI `reasoning_effort`, Anthropic `thinking`
+ * (`budget_tokens` tiers), Google `generationConfig.thinkingConfig.thinkingBudget`,
+ * Ollama `think`. `'none'` disables reasoning where the provider allows it.
+ * Unset means the provider's own default — the nugget never sends the knob
+ * unasked, because non-reasoning models reject it.
+ */
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
 export interface ChatRequest {
     model: string;
     messages: ChatMessage[];
     temperature?: number;
     maxTokens?: number;
     topP?: number;
+    /**
+     * Reasoning effort for thinking-capable models — see {@link ReasoningEffort}.
+     * A provider-native value in `providerOptions` (e.g. `reasoning_effort`,
+     * `thinking`, `thinkingConfig`, `think`) wins over this on collision.
+     */
+    reasoningEffort?: ReasoningEffort;
     responseFormat?: {
         type: 'text';
     } | {
@@ -42,14 +69,52 @@ export interface ChatRequest {
     stopSequences?: string[];
     signal?: AbortSignal;
     metadata?: Record<string, unknown>;
+    /**
+     * Provider-native request fields the nugget does not model as first-class
+     * options — an escape hatch so a caller can reach a capability without waiting
+     * for a library release. Merged into the outgoing provider request body:
+     * shallow at the top level, and one level deep into the provider's own nested
+     * option container (Ollama `options`, Google `generationConfig`). Examples:
+     * `{ options: { num_ctx: 8192 }, keep_alive: '30m' }` (Ollama),
+     * `{ reasoning_effort: 'high' }` (OpenAI), `{ thinking: { type: 'enabled' } }`
+     * (Anthropic), `{ safetySettings: [...] }` (Google). Values here win over the
+     * nugget's own fields on a key collision, so use with care.
+     */
+    providerOptions?: Record<string, unknown>;
 }
 export interface Connection {
     id: string;
-    provider: string;
+    /**
+     * A provider with a profile in the table, or any other string — an unknown
+     * key with a `baseUrl` resolves through the `openai-compat` escape hatch.
+     * The union is there for autocomplete and typo-catching; the `string & {}`
+     * arm keeps the escape hatch open.
+     */
+    provider: KnownProvider | (string & {});
     baseUrl?: string;
+    /** Select the wire protocol explicitly; existing connections keep their default. */
+    protocol?: 'chat-completions' | 'responses' | 'converse';
+    /** Cloud endpoint coordinates. An explicit baseUrl takes precedence. */
+    cloud?: {
+        region?: string;
+        project?: string;
+        location?: string;
+        accountId?: string;
+        workspace?: string;
+        bedrockEndpoint?: 'runtime' | 'mantle';
+    };
+    /** Override the profile's key header (e.g. Azure Entra bearer tokens). */
+    auth?: 'bearer' | 'api-key-header';
     keyRef?: KeyRef;
     timeoutMs?: number;
     headers?: Record<string, string>;
+    /**
+     * Idle timeout for streaming calls: aborts the stream only if no bytes arrive
+     * for this many milliseconds, resetting on every chunk. Distinct from
+     * `timeoutMs`, which bounds the total call lifetime. Set this (and a generous
+     * `timeoutMs`) for long local generations that stream slowly but healthily.
+     */
+    idleTimeoutMs?: number;
 }
 export type KeyRef = {
     kind: 'none';
@@ -70,15 +135,22 @@ export interface KeySource {
     resolve(ref: KeyRef): Promise<{
         ok: true;
         apiKey: string | null;
+        authorize?: RequestAuthorizer;
     } | {
         ok: false;
         reason: 'missing' | 'locked' | 'denied';
     }>;
 }
+/** Optional SDK-backed signing seam (e.g. AWS SigV4). Credentials stay in KeySource.
+ * Called for each HTTP attempt with the final URL/body and a bounded signal.
+ * Return a signed Request; preserve its URL, method, body and signal. */
+export type RequestAuthorizer = (request: Request) => Promise<Request>;
 export interface ResolvedConnection extends Connection {
     baseUrl: string;
     apiKey: string | null;
     headers: Record<string, string>;
+    /** Internal transport bound by the handler; never exposed to hooks. */
+    fetch?: typeof fetch;
 }
 export interface Usage {
     inputTokens?: number;
@@ -87,6 +159,7 @@ export interface Usage {
 }
 export interface ChatResult {
     text: string;
+    providerState?: ProviderState;
     toolCalls?: ToolCall[];
     finishReason: 'stop' | 'length' | 'tool' | 'content_filter' | 'error' | 'canceled';
     usage: Usage;
@@ -103,8 +176,27 @@ export interface ModelSource {
     connectionId: string;
     baseUrl?: string;
 }
+export interface EmbedRequest {
+    model: string;
+    /** One string, or a batch of strings embedded in a single call. */
+    input: string | string[];
+    signal?: AbortSignal;
+    metadata?: Record<string, unknown>;
+    /** Provider-native passthrough, same contract as {@link ChatRequest.providerOptions}. */
+    providerOptions?: Record<string, unknown>;
+}
+export interface EmbedResult {
+    /** One vector per input, in input order. */
+    embeddings: number[][];
+    model: string;
+    usage: Usage;
+    source: ModelSource;
+    raw?: unknown;
+}
 export declare function modelRef(source: ModelSource, model: string): string;
-export type AIErrorKind = 'auth' | 'rate_limit' | 'timeout' | 'network' | 'server' | 'invalid_request' | 'invalid_response' | 'context_length' | 'canceled' | 'policy_blocked' | 'key_unavailable' | 'tool_error' | 'budget_exceeded';
+export type AIErrorKind = 'auth' | 'rate_limit' | 'timeout' | 'network' | 'server' | 'invalid_request' | 'invalid_response'
+/** 404/410 — endpoint, deployment, or model not found (wrong baseUrl/model, or a misrouted edge). */
+ | 'not_found' | 'context_length' | 'canceled' | 'policy_blocked' | 'key_unavailable' | 'tool_error' | 'budget_exceeded';
 export type StreamEvent = {
     type: 'start';
     callId: string;
@@ -112,6 +204,9 @@ export type StreamEvent = {
     model: string;
 } | {
     type: 'delta';
+    text: string;
+} | {
+    type: 'reasoning';
     text: string;
 } | {
     type: 'tool_call';
@@ -141,6 +236,7 @@ export interface ProviderAdapter {
         ok: boolean;
         detail?: string;
     }>;
+    embed?(conn: ResolvedConnection, req: EmbedRequest): Promise<EmbedResult>;
 }
 export interface ModelInfo {
     id: string;
@@ -168,6 +264,15 @@ export interface CallInfo {
     provider: string;
     model: string;
     metadata?: Record<string, unknown>;
+    /**
+     * The fully resolved connection for this call — base URL defaulted from the
+     * provider profile and auth headers applied. Present whenever `beforeCall`
+     * runs after resolution (chat/stream and probes), letting a hook validate the
+     * *effective* endpoint (e.g. a request-time SSRF/DNS-rebinding re-check on the
+     * resolved `baseUrl`) without duplicating profile logic. The resolved
+     * `apiKey` is intentionally not exposed here.
+     */
+    resolved?: Omit<ResolvedConnection, 'apiKey'>;
 }
 export interface CallRecord {
     callId: string;
@@ -187,5 +292,40 @@ export interface CallRecord {
     metadata?: Record<string, unknown>;
     promptChars: number;
     responseChars: number;
+    /**
+     * Estimated cost of this call in USD, computed by the optional `pricing` hook
+     * passed to the handler. Undefined when no pricing hook is configured or the
+     * hook returns nothing for this provider/model.
+     */
+    costUsd?: number;
+}
+/**
+ * Minimal [Standard Schema](https://standardschema.dev) validator surface. Any
+ * Zod / Valibot / ArkType schema (v1+) satisfies this via its `~standard`
+ * property, so `chatParsed` can validate model output against a schema the app
+ * already owns — with zero dependency added to this library.
+ */
+export interface StandardSchemaV1<Output = unknown> {
+    readonly '~standard': {
+        readonly version: 1;
+        readonly vendor: string;
+        readonly validate: (value: unknown) => StandardSchemaResult<Output> | Promise<StandardSchemaResult<Output>>;
+    };
+}
+export type StandardSchemaResult<Output> = {
+    readonly value: Output;
+    readonly issues?: undefined;
+} | {
+    readonly issues: ReadonlyArray<{
+        readonly message: string;
+        readonly path?: ReadonlyArray<PropertyKey | {
+            readonly key: PropertyKey;
+        }>;
+    }>;
+};
+/** Output of {@link AIHandler.chatParsed}: the validated value plus the raw chat result. */
+export interface ParsedResult<T> {
+    data: T;
+    result: ChatResult;
 }
 //# sourceMappingURL=types.d.ts.map

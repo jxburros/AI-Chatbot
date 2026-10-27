@@ -21,6 +21,56 @@ export function textFromMessages(messages) {
         return message.content.map((part) => part.text ?? '').join('');
     }).join('\n');
 }
+export function globalEnv() {
+    const maybeProcess = globalThis;
+    return maybeProcess.process?.env ?? {};
+}
+/**
+ * Merges app-supplied {@link ChatRequest.providerOptions} into a provider
+ * request body: shallow at the top level, and one level deep for each key in
+ * `nestedKeys` where both sides are plain objects (Ollama `options`, Google
+ * `generationConfig`). Values in `providerOptions` win on collision.
+ */
+export function applyProviderOptions(body, providerOptions, nestedKeys = []) {
+    if (!providerOptions)
+        return body;
+    const merged = { ...body };
+    for (const [key, value] of Object.entries(providerOptions)) {
+        const base = asRecord(merged[key]);
+        if (nestedKeys.includes(key) && base && asRecord(value)) {
+            merged[key] = { ...base, ...value };
+        }
+        else {
+            merged[key] = value;
+        }
+    }
+    return merged;
+}
+/** Joins a base URL and path without producing a double slash, even if `base` ends with `/`. */
+export function joinUrl(base, path) {
+    return `${base.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
+}
+/**
+ * Runs `fn` over `items` with at most `limit` in flight at once, preserving
+ * input order in the returned array. Used to probe many local models
+ * concurrently without opening an unbounded number of sockets.
+ */
+export async function mapWithConcurrency(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    const worker = async () => {
+        for (;;) {
+            const index = next;
+            next += 1;
+            if (index >= items.length)
+                return;
+            results[index] = await fn(items[index], index);
+        }
+    };
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    return results;
+}
 export function sleep(ms, signal) {
     if (ms <= 0)
         return Promise.resolve();
@@ -48,4 +98,17 @@ export function sleep(ms, signal) {
         }
     });
 }
+/**
+ * Token budgets behind the {@link ReasoningEffort} tiers for providers that
+ * express effort as a thinking-token budget (Anthropic `budget_tokens`, Google
+ * `thinkingBudget`). `'none'` is 0. Deliberately conservative: they are floors
+ * a model may stop under, not ceilings it fills.
+ */
+export const REASONING_BUDGET_TOKENS = {
+    none: 0,
+    minimal: 1024,
+    low: 2048,
+    medium: 8192,
+    high: 16384,
+};
 //# sourceMappingURL=util.js.map

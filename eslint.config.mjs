@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Compiled upstream artifacts are linted in AI-Nugget.
+    "vendor/ai-handler/**",
   ]),
 ]);
 

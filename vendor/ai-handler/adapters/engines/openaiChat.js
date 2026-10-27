@@ -1,8 +1,8 @@
 import { AIError } from '../../errors.js';
 import { estimatedUsage } from '../../tokens.js';
-import { postResponse, sseLines } from '../../transport.js';
-import { asNumber, asRecord, asString, textFromMessages } from '../../util.js';
-import { health, listOpenModels, streamError, streamTimeout } from './base.js';
+import { fetchJson, postResponse, sseLines } from '../../transport.js';
+import { applyProviderOptions, asNumber, asRecord, asString, joinUrl, textFromMessages } from '../../util.js';
+import { DEFAULT_TIMEOUT_MS, health, listOpenModels, parseArgs, randomId, safeParse, streamAnomaly, streamError, streamTimeout } from './base.js';
 export class OpenAIChatAdapter {
     profile;
     provider;
@@ -31,22 +31,55 @@ export class OpenAIChatAdapter {
         let outputTokens;
         let finish;
         let sawTerminal = false;
+        let reasoningText = '';
+        let assistantState;
         const timeout = streamTimeout(conn, req.signal);
         yield { type: 'start', callId: '', provider: conn.provider, model: req.model };
         try {
-            const res = await postResponse(urlFor(conn, this.profile, req.model), openAiBody(req, this.profile), conn.headers, timeout.signal, conn.provider);
+            let res;
+            try {
+                res = await postResponse(urlFor(conn, this.profile, req), openAiBody(req, this.profile, conn.provider), conn.headers, timeout.signal, conn.provider, conn.fetch);
+            }
+            catch (error) {
+                // OpenAI's `/chat/completions` refuses function tools on a reasoning model
+                // unless `reasoning_effort` is `'none'` ("Function tools with reasoning_effort
+                // are not supported … use /v1/responses or set reasoning_effort to 'none'").
+                // The nugget never sets `reasoning_effort` itself, so the provider default
+                // applies and every tool-using turn 400s. Rather than make each app learn
+                // this the hard way, retry the one request once with the effort disabled
+                // and say so on the stream. Reactive on purpose: sending
+                // `reasoning_effort` up front would 400 on non-reasoning models instead.
+                // A caller-requested effort is overridden too — the alternative is a hard
+                // 400 with no tool call at all — and the context event says so.
+                if (!shouldRetryWithoutReasoningEffort(error, req))
+                    throw error;
+                yield {
+                    type: 'context',
+                    kind: 'reasoning_effort_disabled_for_tools',
+                    data: {
+                        reason: 'provider rejected function tools with reasoning_effort; retried with reasoning_effort: none',
+                        requested: req.providerOptions?.reasoning_effort ?? req.reasoningEffort ?? null,
+                    },
+                };
+                const retryReq = { ...req, providerOptions: { ...req.providerOptions, reasoning_effort: 'none' } };
+                res = await postResponse(urlFor(conn, this.profile, retryReq), openAiBody(retryReq, this.profile, conn.provider), conn.headers, timeout.signal, conn.provider, conn.fetch);
+            }
             const contentType = res.headers.get('content-type') ?? '';
             if (!contentType.includes('text/event-stream')) {
                 // Server ignored stream:true (or is a buffered gateway) — recover the whole body.
                 const rawText = await res.text().catch(() => '');
                 const raw = safeParse(rawText) ?? { text: rawText };
                 const parsed = parseOpenAiResponse(raw);
+                const choices = asRecord(raw)?.choices;
+                assistantState = asRecord(asRecord(Array.isArray(choices) ? choices[0] : undefined)?.message);
                 text = parsed.text;
                 toolCalls = parsed.toolCalls;
                 inputTokens = parsed.inputTokens;
                 outputTokens = parsed.outputTokens;
                 finish = parsed.finish;
                 sawTerminal = true;
+                if (parsed.reasoning)
+                    yield { type: 'reasoning', text: parsed.reasoning };
                 if (text)
                     yield { type: 'delta', text };
                 for (const call of toolCalls)
@@ -55,6 +88,7 @@ export class OpenAIChatAdapter {
             else {
                 const partialTools = new Map();
                 for await (const line of sseLines(res)) {
+                    timeout.bump();
                     const chunk = safeParse(line);
                     const record = asRecord(chunk);
                     if (!record)
@@ -68,6 +102,13 @@ export class OpenAIChatAdapter {
                     if (choice?.finish_reason)
                         sawTerminal = true;
                     const delta = asRecord(choice?.delta);
+                    // Reasoning tokens (DeepSeek `reasoning_content`, others `reasoning`)
+                    // ride their own channel so they don't contaminate the answer text.
+                    const reasoning = asString(delta?.reasoning_content) ?? asString(delta?.reasoning);
+                    if (reasoning)
+                        reasoningText += reasoning;
+                    if (reasoning)
+                        yield { type: 'reasoning', text: reasoning };
                     const piece = asString(delta?.content);
                     if (piece) {
                         if (firstTokenMs === null)
@@ -96,10 +137,16 @@ export class OpenAIChatAdapter {
                 for (const call of toolCalls)
                     yield { type: 'tool_call', call };
             }
-            if (!sawTerminal) {
-                yield { type: 'context', kind: 'stream_anomaly', data: { reason: 'stream ended without a finish_reason' } };
-            }
+            if (!sawTerminal)
+                yield streamAnomaly('stream ended without a finish_reason');
             const result = makeResult(conn, req, text, toolCalls, finish, started, firstTokenMs, inputTokens, outputTokens);
+            if (this.profile.quirks?.preserveAssistantState) {
+                result.providerState = { provider: conn.provider, model: req.model, protocol: 'chat-completions', content: [assistantState ?? {
+                            role: 'assistant', content: text,
+                            ...(reasoningText ? { reasoning_content: reasoningText } : {}),
+                            ...(toolCalls.length ? { tool_calls: toolCalls.map(call => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.raw ?? JSON.stringify(call.arguments) } })) } : {}),
+                        }] };
+            }
             yield { type: 'done', result };
         }
         catch (error) {
@@ -115,11 +162,47 @@ export class OpenAIChatAdapter {
     health(conn) {
         return health(conn, this.profile);
     }
+    async embed(conn, req) {
+        if (this.profile.quirks?.embeddings === false)
+            throw new AIError(`${conn.provider} does not expose OpenAI-compatible embeddings on this endpoint`, { kind: 'invalid_request', retryable: false, provider: conn.provider });
+        const inputs = Array.isArray(req.input) ? req.input : [req.input];
+        const { data } = await fetchJson(joinUrl(conn.baseUrl, '/embeddings'), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...conn.headers },
+            body: JSON.stringify(applyProviderOptions({ model: req.model, input: inputs }, req.providerOptions)),
+            signal: req.signal,
+            timeoutMs: conn.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            provider: conn.provider,
+            fetch: conn.fetch,
+        });
+        const record = asRecord(data);
+        const rows = Array.isArray(record?.data) ? record.data : [];
+        // Order by the `index` each row reports, falling back to array order.
+        const byIndex = rows
+            .map((row, i) => ({ index: asNumber(asRecord(row)?.index) ?? i, embedding: asEmbedding(asRecord(row)?.embedding) }))
+            .sort((a, b) => a.index - b.index);
+        const usage = asRecord(record?.usage);
+        const inputTokens = asNumber(usage?.prompt_tokens);
+        return {
+            embeddings: byIndex.map((row) => row.embedding),
+            model: req.model,
+            usage: { inputTokens, outputTokens: 0, estimated: inputTokens === undefined },
+            source: { provider: conn.provider, connectionId: conn.id, baseUrl: conn.baseUrl },
+            raw: data,
+        };
+    }
 }
-function openAiBody(req, profile) {
+function asEmbedding(value) {
+    return Array.isArray(value) ? value.filter((n) => typeof n === 'number') : [];
+}
+function openAiBody(req, profile, provider) {
     const body = {
         model: req.model,
-        messages: req.messages.map(toOpenAiMessage),
+        messages: req.messages.map(message => {
+            const state = message.providerState;
+            return profile.quirks?.preserveAssistantState && message.role === 'assistant' && state?.provider === provider && state.model === req.model && state.protocol === 'chat-completions'
+                ? state.content[0] ?? toOpenAiMessage(message) : toOpenAiMessage(message);
+        }),
         temperature: req.temperature,
         top_p: req.topP,
         stop: req.stopSequences,
@@ -134,7 +217,16 @@ function openAiBody(req, profile) {
     };
     if (req.maxTokens !== undefined)
         body[profile.quirks?.maxTokensParam ?? 'max_tokens'] = req.maxTokens;
-    return body;
+    // First-class reasoning effort → OpenAI's `reasoning_effort`. Only sent when
+    // asked for: non-reasoning models reject the parameter outright.
+    if (req.reasoningEffort !== undefined)
+        body.reasoning_effort = req.reasoningEffort;
+    // providerOptions carries OpenAI-native fields the nugget doesn't model
+    // (`reasoning_effort`, `parallel_tool_calls`, `seed`, `logprobs`, …). `apiVersion`
+    // is consumed by urlFor for Azure and stripped here so it never hits the body.
+    const { apiVersion, ...passthrough } = req.providerOptions ?? {};
+    void apiVersion;
+    return applyProviderOptions(body, Object.keys(passthrough).length ? passthrough : undefined);
 }
 function responseFormatFor(req, profile) {
     if (req.responseFormat?.type !== 'json')
@@ -157,11 +249,18 @@ function toOpenAiMessage(message) {
         tool_calls: message.toolCalls?.map((call) => ({ id: call.id, type: 'function', function: { name: call.name, arguments: call.raw ?? JSON.stringify(call.arguments) } })),
     };
 }
-function urlFor(conn, profile, model) {
+function urlFor(conn, profile, req) {
     if (profile.quirks?.urlTemplate) {
-        return profile.quirks.urlTemplate.replace('{baseUrl}', conn.baseUrl).replace('{model}', encodeURIComponent(model));
+        // `{apiVersion}` (Azure) is filled from a per-call override, then the
+        // profile default — so a retired Azure api-version is fixable without a
+        // library release: pass `providerOptions: { apiVersion: '2025-01-01-preview' }`.
+        const apiVersion = asString(req.providerOptions?.apiVersion) ?? profile.quirks.apiVersion ?? '';
+        return profile.quirks.urlTemplate
+            .replace('{baseUrl}', conn.baseUrl)
+            .replace('{model}', encodeURIComponent(req.model))
+            .replace('{apiVersion}', apiVersion);
     }
-    return `${conn.baseUrl}/chat/completions`;
+    return joinUrl(conn.baseUrl, '/chat/completions');
 }
 function parseOpenAiResponse(raw) {
     const record = asRecord(raw);
@@ -169,9 +268,11 @@ function parseOpenAiResponse(raw) {
     const choice = asRecord(Array.isArray(record?.choices) ? record.choices[0] : undefined);
     const message = asRecord(choice?.message);
     const text = asString(message?.content) ?? asString(record?.text) ?? '';
+    const reasoning = asString(message?.reasoning_content) ?? asString(message?.reasoning);
     const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
     return {
         text,
+        reasoning,
         finish: asString(choice?.finish_reason),
         toolCalls: calls.map((value) => {
             const call = asRecord(value);
@@ -206,23 +307,23 @@ function mapFinish(finish, hasToolCalls) {
         return 'content_filter';
     return 'stop';
 }
-function parseArgs(raw) {
-    try {
-        return raw ? JSON.parse(raw) : {};
-    }
-    catch {
-        return {};
-    }
-}
-function safeParse(line) {
-    try {
-        return JSON.parse(line);
-    }
-    catch {
-        return undefined;
-    }
-}
-function randomId() {
-    return globalThis.crypto?.randomUUID?.() ?? `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+/**
+ * True when a `/chat/completions` 400 is the "function tools with reasoning_effort
+ * are not supported" refusal AND the request actually carried tools AND the caller
+ * did not already pin `reasoning_effort` (in which case the choice is theirs).
+ */
+export function shouldRetryWithoutReasoningEffort(error, req) {
+    if (!(error instanceof AIError) || error.status !== 400)
+        return false;
+    if (!req.tools || req.tools.length === 0)
+        return false;
+    // Already `'none'` (from either knob) — the refusal is about something else.
+    const effective = req.providerOptions && 'reasoning_effort' in req.providerOptions
+        ? req.providerOptions.reasoning_effort
+        : req.reasoningEffort;
+    if (effective === 'none')
+        return false;
+    const text = `${error.raw ?? ''} ${error.message}`.toLowerCase();
+    return text.includes('reasoning_effort') && text.includes('tool');
 }
 //# sourceMappingURL=openaiChat.js.map
