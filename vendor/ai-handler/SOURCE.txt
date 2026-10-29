@@ -1,0 +1,2 @@
+https://github.com/jxburros/AI-Nugget/tree/f8e563fd6c23957b0885e131c5aac4e9a7851693
+Generated dist, version 0.7.5; do not hand-edit.

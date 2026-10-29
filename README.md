@@ -1,7 +1,7 @@
 # Sprout's Garden Chat
 
 A small garden-themed AI chatbot built with Next.js (App Router) and
-[`@jxburros/ai-handler`](https://github.com/jxburros/AI-Nugget) ("AI Nugget") —
+[`@jxburros/ai-nugget`](https://github.com/jxburros/AI-Nugget) ("AI Nugget") —
 a zero-dependency, isomorphic TypeScript library that handles provider calls,
 retries, and streaming for OpenAI, Anthropic, Google, Ollama, and
 OpenAI-compatible endpoints.
@@ -124,3 +124,7 @@ Nugget into a real app, and how they were worked around.
 ## Project Stewardship
 
 This project is developed by **Jeffrey** through **JX Holdings, LLC**. GitHub: [`jxburros`](https://github.com/jxburros).
+
+### AI Nugget adoption
+
+This branch adopts AI Nugget 0.7.5 from source commit [`f8e563fd6c23`](https://github.com/jxburros/AI-Nugget/commit/f8e563fd6c23957b0885e131c5aac4e9a7851693) while [the upstream change](https://github.com/jxburros/AI-Nugget/pull/98) is under review. The compiled vendor copy records provenance in `vendor/ai-handler/SOURCE.txt`. App-specific model selection and provider configuration still apply.

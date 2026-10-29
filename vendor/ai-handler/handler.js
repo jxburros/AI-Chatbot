@@ -1,9 +1,22 @@
 import { adapterFor } from './adapters/index.js';
 import { applyAuth, profileFor } from './adapters/profiles.js';
+import { connectionBaseUrl } from './adapters/cloud.js';
 import { AIError, fromUnknown } from './errors.js';
+import { extractJson } from './json.js';
+import { containsReasoningBlock, createReasoningStripper, stripReasoningBlocks } from './reasoning.js';
 import { allowAllPolicy } from './policy.js';
 import { SessionRedactor } from './redact.js';
 import { promptChars, sleep } from './util.js';
+/**
+ * A *startup* notice, so it fires once per process rather than once per handler
+ * — an app that builds a handler per request would otherwise flood its logs
+ * with a message that says the same thing every time.
+ */
+let warnedNoPolicy = false;
+/** Test seam: reset the once-per-process startup notice. */
+export function resetPolicyWarningForTests() {
+    warnedNoPolicy = false;
+}
 export class AIHandler {
     opts;
     active = 0;
@@ -14,6 +27,15 @@ export class AIHandler {
     constructor(opts) {
         this.opts = opts;
         this.policy = opts.policy ?? allowAllPolicy();
+        // `allowAllPolicy()` stays the default — a library must not decide an app's
+        // governance — but "no policy configured" should be visible at runtime, not
+        // only in a README paragraph. Passing an explicit policy (including
+        // `allowAllPolicy()`) is the opt-out.
+        if (!opts.policy && !opts.silencePolicyWarning && !warnedNoPolicy) {
+            warnedNoPolicy = true;
+            globalThis.console?.warn?.('[ai-nugget] No GovernancePolicy configured — every provider/model is allowed. ' +
+                'Pass `policy` (e.g. allowlistPolicy(...)), or `policy: allowAllPolicy()` / `silencePolicyWarning: true` to accept this deliberately.');
+        }
     }
     async chat(conn, req) {
         let result;
@@ -30,43 +52,14 @@ export class AIHandler {
     async *stream(conn, req) {
         const callId = createCallId();
         const startedAt = Date.now();
-        const adapter = adapterFor(conn.provider, conn.baseUrl);
-        const policyResult = this.policy.checkModel(conn.provider, req.model);
-        if (!policyResult.allowed) {
-            const error = new AIError(policyResult.reason, { kind: 'policy_blocked', retryable: false, provider: conn.provider });
-            await this.recordFailure(callId, conn, req, startedAt, 1, error);
-            yield { type: 'error', error: this.redactedError(error) };
-            return;
-        }
-        let resolved;
-        try {
-            resolved = await this.resolveConnection(conn);
-        }
-        catch (errorValue) {
-            // Key resolution failures (missing/locked/denied) are a recorded outcome,
-            // not an uncaught throw — the traceability contract covers them too.
-            const error = fromUnknown(errorValue, conn.provider);
-            await this.recordFailure(callId, conn, req, startedAt, 1, error);
-            yield { type: 'error', error: this.redactedError(error) };
-            return;
-        }
-        const info = { callId, connection: conn, provider: conn.provider, model: req.model, metadata: req.metadata };
-        try {
-            if (await this.opts.hooks?.beforeCall?.(info) === 'deny') {
-                const error = new AIError('Call denied by beforeCall hook', { kind: 'policy_blocked', retryable: false, provider: conn.provider });
-                await this.recordFailure(callId, conn, req, startedAt, 1, error);
-                yield { type: 'error', error: this.redactedError(error) };
-                return;
-            }
-        }
-        catch (errorValue) {
-            // A throwing beforeCall hook is a recorded, redacted outcome too — not
-            // an uncaught throw that skips telemetry and the redaction guarantee.
-            const error = fromUnknown(errorValue, conn.provider);
-            await this.recordFailure(callId, conn, req, startedAt, 1, error);
-            yield { type: 'error', error: this.redactedError(error) };
-            return;
-        }
+        const preflight = await this.preflight(callId, conn, req.model, req.metadata);
+        if (!preflight.ok)
+            return yield* this.failStream(callId, conn, req, startedAt, 1, preflight.error);
+        // One idempotency key per logical call, reused across every retry attempt,
+        // so a provider that supports it collapses a re-sent generation instead of
+        // billing it twice (see `supportsIdempotencyKey` in the profile table).
+        const resolved = withIdempotencyKey(preflight.resolved, callId);
+        const adapter = adapterFor(conn.provider, resolved.baseUrl, conn.protocol);
         let acquired = false;
         let recorded = false;
         let attempt = 0;
@@ -76,8 +69,11 @@ export class AIHandler {
             const maxAttempts = this.opts.retry?.maxAttempts ?? 3;
             let emittedStart = false;
             let emittedOutput = false;
+            const stripInline = this.opts.stripInlineReasoning !== false;
             for (;;) {
                 attempt += 1;
+                // One stripper per attempt: a retried stream starts its tag state over.
+                const stripper = stripInline ? createReasoningStripper() : null;
                 try {
                     for await (const event of adapter.stream(resolved, req)) {
                         if (event.type === 'start') {
@@ -87,12 +83,33 @@ export class AIHandler {
                             }
                             continue;
                         }
-                        if (event.type === 'delta' || event.type === 'tool_call')
+                        if (event.type === 'delta' || event.type === 'tool_call' || event.type === 'reasoning')
                             emittedOutput = true;
+                        if (event.type === 'delta' && stripper) {
+                            // Inline reasoning never reaches `delta`; it rides the reasoning channel like a
+                            // provider-native thinking field would.
+                            const piece = stripper.push(event.text);
+                            if (piece.reasoning)
+                                yield { type: 'reasoning', text: piece.reasoning };
+                            if (piece.visible)
+                                yield { type: 'delta', text: piece.visible };
+                            continue;
+                        }
                         if (event.type === 'done') {
-                            await this.recordSuccess(callId, conn, req, startedAt, attempt, event.result);
+                            let result = event.result;
+                            if (stripper) {
+                                const tail = stripper.end();
+                                if (tail.reasoning)
+                                    yield { type: 'reasoning', text: tail.reasoning };
+                                if (tail.visible)
+                                    yield { type: 'delta', text: tail.visible };
+                                if (containsReasoningBlock(result.text)) {
+                                    result = { ...result, text: stripReasoningBlocks(result.text) };
+                                }
+                            }
+                            await this.recordSuccess(callId, conn, req, startedAt, attempt, result);
                             recorded = true;
-                            yield event;
+                            yield { ...event, result };
                             return;
                         }
                         yield event;
@@ -101,11 +118,11 @@ export class AIHandler {
                 }
                 catch (errorValue) {
                     const error = fromUnknown(errorValue, conn.provider);
+                    // `emittedOutput` stops retries once any byte has reached the caller:
+                    // never silently re-run a partially delivered answer.
                     if (!error.retryable || attempt >= maxAttempts || req.signal?.aborted || emittedOutput) {
-                        await this.recordFailure(callId, conn, req, startedAt, attempt, error);
                         recorded = true;
-                        yield { type: 'error', error: this.redactedError(error) };
-                        return;
+                        return yield* this.failStream(callId, conn, req, startedAt, attempt, error);
                     }
                     const delayMs = this.retryDelay(error, attempt);
                     yield { type: 'retry', attempt, reason: error.kind, delayMs };
@@ -113,21 +130,15 @@ export class AIHandler {
                         await sleep(delayMs, req.signal);
                     }
                     catch (sleepError) {
-                        const canceled = fromUnknown(sleepError, conn.provider);
-                        await this.recordFailure(callId, conn, req, startedAt, attempt, canceled);
                         recorded = true;
-                        yield { type: 'error', error: this.redactedError(canceled) };
-                        return;
+                        return yield* this.failStream(callId, conn, req, startedAt, attempt, fromUnknown(sleepError, conn.provider));
                     }
                 }
             }
         }
         catch (errorValue) {
-            const error = fromUnknown(errorValue, conn.provider);
-            await this.recordFailure(callId, conn, req, startedAt, Math.max(1, attempt), error);
             recorded = true;
-            yield { type: 'error', error: this.redactedError(error) };
-            return;
+            return yield* this.failStream(callId, conn, req, startedAt, Math.max(1, attempt), fromUnknown(errorValue, conn.provider));
         }
         finally {
             if (acquired)
@@ -137,16 +148,62 @@ export class AIHandler {
             }
         }
     }
+    /**
+     * The shared pre-call preamble: policy check → key resolution → `beforeCall`
+     * hook. Every entry point (`stream`, `embed`, `listModels`/`testConnection`)
+     * runs exactly this sequence, so it lives once. Failures are *returned*, not
+     * recorded — each caller owns its own telemetry shape (`recordFailure` for
+     * chat/probe, `recordEmbed` for embeddings) and records the returned error.
+     */
+    async preflight(callId, conn, model, metadata) {
+        const policyResult = this.policy.checkModel(conn.provider, model);
+        if (!policyResult.allowed) {
+            return { ok: false, error: new AIError(policyResult.reason, { kind: 'policy_blocked', retryable: false, provider: conn.provider }) };
+        }
+        let resolved;
+        try {
+            resolved = await this.resolveConnection(conn);
+        }
+        catch (errorValue) {
+            // Key resolution failures (missing/locked/denied) are a recorded outcome,
+            // not an uncaught throw — the traceability contract covers them too.
+            return { ok: false, error: fromUnknown(errorValue, conn.provider) };
+        }
+        try {
+            const info = {
+                callId,
+                connection: safeConnection(conn),
+                provider: conn.provider,
+                model,
+                metadata,
+                resolved: safeResolved(resolved),
+            };
+            if (await this.opts.hooks?.beforeCall?.(info) === 'deny') {
+                return { ok: false, error: new AIError('Call denied by beforeCall hook', { kind: 'policy_blocked', retryable: false, provider: conn.provider }) };
+            }
+        }
+        catch (errorValue) {
+            // A throwing beforeCall hook is a recorded, redacted outcome too — not
+            // an uncaught throw that skips telemetry and the redaction guarantee.
+            return { ok: false, error: fromUnknown(errorValue, conn.provider) };
+        }
+        return { ok: true, resolved };
+    }
+    /** Record a failed call and emit the single redacted `error` event for it. */
+    async *failStream(callId, conn, req, startedAt, attempts, error) {
+        await this.recordFailure(callId, conn, req, startedAt, attempts, error);
+        yield { type: 'error', error: this.redactedError(error) };
+    }
     async listModels(conn) {
         return this.runProbe(conn, '__listModels__', async (resolved) => {
-            const adapter = adapterFor(conn.provider, conn.baseUrl);
+            const adapter = adapterFor(conn.provider, resolved.baseUrl, conn.protocol);
             return adapter.listModels?.(resolved) ?? [];
         });
     }
     async testConnection(conn) {
         try {
             return await this.runProbe(conn, '__testConnection__', async (resolved) => {
-                const adapter = adapterFor(conn.provider, conn.baseUrl);
+                const adapter = adapterFor(conn.provider, resolved.baseUrl, conn.protocol);
                 const health = await adapter.health?.(resolved);
                 if (health) {
                     if (!health.ok)
@@ -161,23 +218,111 @@ export class AIHandler {
             return { ok: false, message: error instanceof Error ? this.redact(error.message) : 'Connection failed' };
         }
     }
+    /**
+     * Warm a connection so the first real call doesn't pay cold DNS/TLS and
+     * (for a local daemon) process spin-up on the hot path. Runs a lightweight
+     * health probe and never throws — call it once at boot. Combined with a CJS
+     * `require` path it removes the cold-start "offline" false negative.
+     */
+    async prewarm(conn) {
+        try {
+            await this.testConnection(conn);
+        }
+        catch {
+            // Warm-up only: a failure here just means the first real call pays the cost.
+        }
+    }
+    /**
+     * Chat that returns typed, validated output. Requests JSON mode, extracts the
+     * JSON from the reply, and validates it against any Standard Schema validator
+     * (Zod / Valibot / ArkType). On a validation miss it performs exactly one
+     * corrective retry that shows the model its error, then throws
+     * `invalid_response` if still invalid. No schema library is bundled — the
+     * caller supplies the schema.
+     */
+    async chatParsed(conn, req, schema) {
+        const base = { ...req, responseFormat: req.responseFormat ?? { type: 'json' } };
+        let result = await this.chat(conn, base);
+        let validated = await validateWithSchema(schema, result.text);
+        if (validated.ok)
+            return { data: validated.value, result };
+        const retry = {
+            ...base,
+            messages: [
+                ...base.messages,
+                { role: 'assistant', content: result.text },
+                { role: 'user', content: `That response did not match the required schema (${validated.message}). Reply again with ONLY a valid JSON value that matches it.` },
+            ],
+        };
+        result = await this.chat(conn, retry);
+        validated = await validateWithSchema(schema, result.text);
+        if (validated.ok)
+            return { data: validated.value, result };
+        throw new AIError(`Model output failed schema validation: ${validated.message}`, { kind: 'invalid_response', provider: conn.provider });
+    }
+    /**
+     * Produce embeddings through the same governed pipeline as chat: policy check,
+     * key resolution, `beforeCall` hook, concurrency, and exactly one redacted
+     * telemetry record. Throws a typed `invalid_request` error for providers whose
+     * adapter has no `embed` (Anthropic, Google) rather than failing silently.
+     */
+    async embed(conn, req) {
+        const callId = createCallId();
+        const startedAt = Date.now();
+        const inputChars = (Array.isArray(req.input) ? req.input : [req.input]).reduce((sum, text) => sum + text.length, 0);
+        const fail = async (error) => {
+            await this.recordEmbed(callId, conn, req, startedAt, { estimated: true }, inputChars, error);
+            throw this.redactedError(error);
+        };
+        const preflight = await this.preflight(callId, conn, req.model, req.metadata);
+        if (!preflight.ok)
+            return fail(preflight.error);
+        const resolved = preflight.resolved;
+        const adapter = adapterFor(conn.provider, resolved.baseUrl, conn.protocol);
+        if (!adapter.embed) {
+            return fail(new AIError(`Provider ${conn.provider} does not support embeddings`, { kind: 'invalid_request', retryable: false, provider: conn.provider }));
+        }
+        await this.acquire(req.signal);
+        try {
+            const result = await adapter.embed(resolved, req);
+            await this.recordEmbed(callId, conn, req, startedAt, result.usage, inputChars);
+            return result;
+        }
+        catch (errorValue) {
+            return fail(fromUnknown(errorValue, conn.provider));
+        }
+        finally {
+            this.release();
+        }
+    }
+    async recordEmbed(callId, conn, req, startedAt, usage, inputChars, error) {
+        const costUsd = error ? undefined : this.opts.pricing?.({ provider: conn.provider, model: req.model, usage });
+        await this.record({
+            callId,
+            connectionId: conn.id,
+            provider: conn.provider,
+            model: req.model,
+            startedAt,
+            timing: { firstTokenMs: null, totalMs: Date.now() - startedAt },
+            usage,
+            finishReason: error ? (error.kind === 'canceled' ? 'canceled' : 'error') : 'stop',
+            ...(error ? { error: { kind: error.kind, status: error.status, message: error.message } } : {}),
+            attempts: 1,
+            metadata: { ...req.metadata, operation: '__embed__' },
+            promptChars: inputChars,
+            responseChars: 0,
+            ...(costUsd !== undefined ? { costUsd } : {}),
+        });
+    }
     async runProbe(conn, operation, action) {
         const callId = createCallId();
         const startedAt = Date.now();
         const req = { model: operation, messages: [], metadata: { operation } };
-        const policyResult = this.policy.checkModel(conn.provider, operation);
-        if (!policyResult.allowed) {
-            const error = new AIError(policyResult.reason, { kind: 'policy_blocked', retryable: false, provider: conn.provider });
-            await this.recordFailure(callId, conn, req, startedAt, 1, error);
-            throw this.redactedError(error);
-        }
-        let resolved;
         try {
-            resolved = await this.resolveConnection(conn);
-            const info = { callId, connection: conn, provider: conn.provider, model: operation, metadata: req.metadata };
-            if (await this.opts.hooks?.beforeCall?.(info) === 'deny') {
-                throw new AIError('Call denied by beforeCall hook', { kind: 'policy_blocked', retryable: false, provider: conn.provider });
-            }
+            const preflight = await this.preflight(callId, conn, operation, req.metadata);
+            if (!preflight.ok)
+                throw preflight.error;
+            const resolved = preflight.resolved;
             await this.acquire(undefined);
             try {
                 const value = await action(resolved);
@@ -203,7 +348,7 @@ export class AIHandler {
     }
     async resolveConnection(conn) {
         const profile = profileFor(conn.provider, conn.baseUrl);
-        const baseUrl = conn.baseUrl ?? profile.defaultBaseUrl;
+        const baseUrl = connectionBaseUrl(conn);
         if (!baseUrl)
             throw new AIError(`Provider ${conn.provider} requires baseUrl`, { kind: 'invalid_request', retryable: false, provider: conn.provider });
         const keyRef = conn.keyRef ?? { kind: 'none' };
@@ -212,11 +357,36 @@ export class AIHandler {
             throw new AIError(`API key unavailable: ${key.reason}`, { kind: 'key_unavailable', retryable: false, provider: conn.provider });
         }
         this.sessionRedactor.addSecret(key.apiKey);
+        const transport = this.opts.fetch ?? globalThis.fetch;
+        const authorize = key.authorize;
+        const signedFetch = authorize ? async (input, init) => {
+            const request = new Request(input, init);
+            // Keep the engine-owned signal directly; Request creates a follower signal.
+            const signal = init?.signal ?? request.signal;
+            let signed;
+            try {
+                signed = await abortableAuthorization(authorize(request), signal);
+            }
+            catch {
+                if (signal.aborted)
+                    throw new AIError('Request authorization canceled', { kind: 'canceled', retryable: false, provider: conn.provider });
+                // Signer errors can contain SDK credential objects; never forward them.
+                throw new AIError('Request authorization failed', { kind: 'auth', retryable: false, provider: conn.provider });
+            }
+            if (signed.url !== request.url || signed.method !== request.method) {
+                throw new AIError('Request authorizer changed the endpoint or method', { kind: 'invalid_request', retryable: false, provider: conn.provider });
+            }
+            for (const name of ['authorization', 'x-amz-security-token', 'x-api-key', 'api-key']) {
+                this.sessionRedactor.addSecret(signed.headers.get(name));
+            }
+            return transport(signed, { signal });
+        } : this.opts.fetch;
         return {
             ...conn,
             baseUrl: trimSlash(baseUrl),
             apiKey: key.apiKey,
-            headers: applyAuth(profile, key.apiKey, conn.headers ?? {}),
+            headers: applyAuth(conn.auth ? { ...profile, auth: conn.auth } : profile, key.apiKey, conn.headers ?? {}),
+            fetch: signedFetch,
         };
     }
     async acquire(signal) {
@@ -241,14 +411,20 @@ export class AIHandler {
         }
         this.active += 1;
         const minInterval = this.opts.limits?.minIntervalMs ?? 0;
-        const wait = Math.max(0, this.lastStarted + minInterval - Date.now());
-        this.lastStarted = Date.now() + wait;
+        const previousLastStarted = this.lastStarted;
+        const wait = Math.max(0, previousLastStarted + minInterval - Date.now());
+        const reserved = Date.now() + wait;
+        this.lastStarted = reserved;
         try {
             if (wait)
                 await sleep(wait, signal);
         }
         catch (error) {
             this.release();
+            // Only undo our own reservation — a later caller may have already
+            // paced itself off `reserved` and must keep that spacing.
+            if (this.lastStarted === reserved)
+                this.lastStarted = previousLastStarted;
             throw error;
         }
     }
@@ -272,6 +448,7 @@ export class AIHandler {
         return Math.round(exponential * (0.75 + Math.random() * 0.5));
     }
     async recordSuccess(callId, conn, req, startedAt, attempts, result) {
+        const costUsd = this.opts.pricing?.({ provider: conn.provider, model: req.model, usage: result.usage });
         await this.record({
             callId,
             connectionId: conn.id,
@@ -285,6 +462,7 @@ export class AIHandler {
             metadata: req.metadata,
             promptChars: promptChars(req.messages),
             responseChars: result.text.length,
+            ...(costUsd !== undefined ? { costUsd } : {}),
         });
     }
     async recordFailure(callId, conn, req, startedAt, attempts, error) {
@@ -365,7 +543,83 @@ function redactMetadata(metadata, redact) {
 function trimSlash(value) {
     return value.replace(/\/+$/, '');
 }
+/**
+ * Drops the resolved API key *and* neutralizes the auth headers built from it,
+ * so a `beforeCall` hook can inspect the endpoint but never the secret.
+ * `keyRef` is scrubbed too — a `{ kind: 'literal' }` ref carries the plaintext
+ * key, and hooks routinely log the whole object.
+ */
+function safeResolved(resolved) {
+    const { apiKey: _apiKey, fetch: _fetch, headers, ...rest } = resolved;
+    return { ...rest, ...safeKeyRef(resolved), headers: maskAuthHeaders(headers) };
+}
+/**
+ * The caller's own `Connection`, with any plaintext `keyRef` masked. Hooks get
+ * the connection so they can key off `id`/`provider`/`baseUrl`; they must never
+ * be handed the secret, since logging `info.connection` for audit is the
+ * obvious thing to do and would otherwise ship the key in clear text.
+ */
+function safeConnection(conn) {
+    return { ...conn, ...safeKeyRef(conn) };
+}
+function safeKeyRef(conn) {
+    if (conn.keyRef?.kind !== 'literal')
+        return conn.keyRef === undefined ? {} : { keyRef: conn.keyRef };
+    return { keyRef: { kind: 'literal', value: REDACTED } };
+}
+const REDACTED = '[REDACTED]';
+/** Header names whose value is derived from the API key by {@link applyAuth}. */
+const AUTH_HEADERS = new Set(['authorization', 'x-api-key', 'x-goog-api-key', 'api-key']);
+function maskAuthHeaders(headers) {
+    const masked = {};
+    for (const [name, value] of Object.entries(headers)) {
+        masked[name] = AUTH_HEADERS.has(name.toLowerCase()) ? REDACTED : value;
+    }
+    return masked;
+}
+/**
+ * Attach a per-call `Idempotency-Key` for providers that honor one, so a retry
+ * after a dropped connection can't be billed as a second generation. Only set
+ * where the profile declares support, and never overrides a caller-supplied
+ * header.
+ */
+function withIdempotencyKey(resolved, callId) {
+    const profile = profileFor(resolved.provider, resolved.baseUrl);
+    if (!profile.quirks?.supportsIdempotencyKey)
+        return resolved;
+    if (Object.keys(resolved.headers).some((name) => name.toLowerCase() === 'idempotency-key'))
+        return resolved;
+    return { ...resolved, headers: { ...resolved.headers, 'idempotency-key': callId } };
+}
+async function validateWithSchema(schema, text) {
+    const value = extractJson(text);
+    if (value === null)
+        return { ok: false, message: 'no JSON found in model output' };
+    const result = await schema['~standard'].validate(value);
+    if (result.issues) {
+        const message = result.issues.map((issue) => issue.message).join('; ');
+        return { ok: false, message: message || 'validation failed' };
+    }
+    return { ok: true, value: result.value };
+}
 function createCallId() {
     return globalThis.crypto?.randomUUID?.() ?? `call_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+/** A stalled SDK signer must not outlive the engine's timeout/cancellation. */
+async function abortableAuthorization(pending, signal) {
+    let abort;
+    try {
+        return await Promise.race([pending, new Promise((_resolve, reject) => {
+                abort = () => reject(signal.reason);
+                if (signal.aborted)
+                    abort();
+                else
+                    signal.addEventListener('abort', abort, { once: true });
+            })]);
+    }
+    finally {
+        if (abort)
+            signal.removeEventListener('abort', abort);
+    }
 }
 //# sourceMappingURL=handler.js.map

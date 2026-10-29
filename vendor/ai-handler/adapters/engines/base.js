@@ -1,6 +1,6 @@
 import { AIError, fromUnknown } from '../../errors.js';
 import { fetchJson, withTimeout } from '../../transport.js';
-import { asRecord, asString } from '../../util.js';
+import { asRecord, asString, joinUrl } from '../../util.js';
 export const DEFAULT_TIMEOUT_MS = 120_000;
 /**
  * Maps a raw streaming failure onto a typed {@link AIError}. A fired timeout is
@@ -13,18 +13,23 @@ export function streamError(error, timeout, provider) {
         return new AIError('Request timed out', { kind: 'timeout', provider });
     return fromUnknown(error, provider);
 }
-/** Create a timeout/abort scope covering the full stream lifetime. */
+/**
+ * Create a timeout/abort scope covering the full stream lifetime, plus an
+ * optional idle timeout (`conn.idleTimeoutMs`) that the engine rearms via
+ * `bump()` on each received chunk.
+ */
 export function streamTimeout(conn, signal) {
-    return withTimeout(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal);
+    return withTimeout(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal, conn.idleTimeoutMs);
 }
 export async function listOpenModels(conn, profile) {
     if (!profile.listModelsPath)
         return [];
-    const { data } = await fetchJson(`${conn.baseUrl}${profile.listModelsPath}`, {
+    const { data } = await fetchJson(joinUrl(conn.baseUrl, profile.listModelsPath), {
         method: 'GET',
         headers: conn.headers,
         timeoutMs: conn.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         provider: conn.provider,
+        fetch: conn.fetch,
     });
     const record = asRecord(data);
     const items = Array.isArray(record?.data) ? record.data : Array.isArray(record?.models) ? record.models : [];
@@ -50,14 +55,17 @@ export async function listOpenModels(conn, profile) {
 }
 export async function health(conn, profile) {
     const path = profile.healthPath ?? profile.listModelsPath;
+    if (!path && profile.quirks?.unsupportedProbe)
+        return { ok: false, detail: 'This endpoint has no lightweight health probe; validate with an explicit model call.' };
     if (!path)
         return { ok: true };
     try {
-        await fetchJson(`${conn.baseUrl}${path}`, {
+        await fetchJson(joinUrl(conn.baseUrl, path), {
             method: 'GET',
             headers: conn.headers,
             timeoutMs: Math.min(conn.timeoutMs ?? DEFAULT_TIMEOUT_MS, 10_000),
             provider: conn.provider,
+            fetch: conn.fetch,
         });
         return { ok: true };
     }
@@ -65,9 +73,49 @@ export async function health(conn, profile) {
         return { ok: false, detail: error instanceof Error ? error.message : 'Health check failed' };
     }
 }
-export function requireResponse(condition, message) {
-    if (!condition)
-        throw new AIError(message, { kind: 'invalid_response' });
+/**
+ * Coerce a provider's tool-call `arguments` into an object. Providers disagree
+ * on the shape: OpenAI/Anthropic stream a JSON *string*, Google and Ollama send
+ * a native object — but Ollama-compatible backends (llama.cpp and friends)
+ * sometimes send a string too. Malformed JSON degrades to `{}` so a single bad
+ * tool call surfaces as an argument-validation error rather than a stream crash.
+ */
+export function parseArgs(raw) {
+    if (raw === undefined || raw === null)
+        return {};
+    if (typeof raw !== 'string')
+        return raw;
+    if (!raw.trim())
+        return {};
+    try {
+        return JSON.parse(raw);
+    }
+    catch {
+        return {};
+    }
+}
+/** JSON.parse that returns undefined instead of throwing — for per-line stream frames. */
+export function safeParse(line) {
+    try {
+        return JSON.parse(line);
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Stable-enough id for a tool call a provider didn't give one for. */
+export function randomId() {
+    return globalThis.crypto?.randomUUID?.() ?? `tool_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+}
+/**
+ * A stream that ended without the provider's terminal marker (an OpenAI
+ * `finish_reason`, an Anthropic `message_delta.stop_reason`, a Google
+ * `finishReason`, an Ollama `done`) was almost certainly truncated. Every
+ * engine yields this so a dropped connection is diagnosable identically
+ * regardless of provider.
+ */
+export function streamAnomaly(reason = 'stream ended without a terminal finish reason') {
+    return { type: 'context', kind: 'stream_anomaly', data: { reason } };
 }
 /**
  * Pulls a context-window figure out of the many shapes providers use for it

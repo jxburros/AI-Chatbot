@@ -1,11 +1,25 @@
 import { AIError, classify, fromUnknown } from './errors.js';
-export function withTimeout(ms, external) {
+export function withTimeout(ms, external, idleMs) {
     const controller = new AbortController();
     let didTimeOut = false;
     const timer = setTimeout(() => {
         didTimeOut = true;
         controller.abort(new AIError(`Request timed out after ${ms}ms`, { kind: 'timeout' }));
     }, ms);
+    // Optional idle timeout: aborts only when no chunk has arrived for `idleMs`,
+    // rearmed on every `bump()`. Keeps a long but healthy stream alive while the
+    // total `ms` ceiling still bounds a truly stuck call.
+    let idleTimer;
+    const armIdle = () => {
+        if (idleMs === undefined)
+            return;
+        if (idleTimer)
+            clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            didTimeOut = true;
+            controller.abort(new AIError(`Request idle for ${idleMs}ms`, { kind: 'timeout' }));
+        }, idleMs);
+    };
     const onAbort = () => controller.abort(external?.reason);
     if (external) {
         if (external.aborted)
@@ -13,14 +27,20 @@ export function withTimeout(ms, external) {
         else
             external.addEventListener('abort', onAbort, { once: true });
     }
+    armIdle();
     return {
         signal: controller.signal,
         done() {
             clearTimeout(timer);
+            if (idleTimer)
+                clearTimeout(idleTimer);
             external?.removeEventListener('abort', onAbort);
         },
         timedOut() {
             return didTimeOut;
+        },
+        bump() {
+            armIdle();
         },
     };
 }
@@ -28,7 +48,8 @@ export async function fetchJson(url, init) {
     const timeout = withTimeout(init.timeoutMs, init.signal ?? undefined);
     const started = Date.now();
     try {
-        const res = await fetch(url, { ...init, signal: timeout.signal });
+        const { fetch: transport = globalThis.fetch, timeoutMs: _timeout, provider: _provider, ...request } = init;
+        const res = await transport(url, { ...request, signal: timeout.signal });
         const raw = await res.text().catch(() => '');
         if (!res.ok)
             throw classify(res.status, raw, init.provider, res.headers);
@@ -53,10 +74,10 @@ export async function fetchJson(url, init) {
  * not merely the connection handshake. Non-2xx responses are classified and
  * thrown before the body is handed back.
  */
-export async function postResponse(url, body, headers, signal, provider) {
+export async function postResponse(url, body, headers, signal, provider, transport = globalThis.fetch) {
     let res;
     try {
-        res = await fetch(url, {
+        res = await transport(url, {
             method: 'POST',
             headers: { 'content-type': 'application/json', ...headers },
             body: JSON.stringify(body),
